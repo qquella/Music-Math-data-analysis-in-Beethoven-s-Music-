@@ -35,6 +35,15 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+# optional, if you added the heatmap util:
+from make_figures import heatmap_voiceleading
+from tda_extras import (
+    build_vl_matrix_from_meta,
+    compute_persistence_and_reports,
+    ensure_pcs_column,
+    summarize_dataframe,
+)
+
 
 # ------------- Robust imports with fallbacks -------------
 def safe_imports():
@@ -301,6 +310,188 @@ def run_mapper(X, meta, outdir, n_cubes=15, overlap=0.45, color_mode="root_pc"):
     print(f"Also wrote: b9_chords_meta.csv, b9_features.csv, b9_lens.csv in {outdir}")
 
 
+import ast
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import networkx as nx
+import numpy as np
+from sklearn.manifold import MDS
+
+
+def _parse_pcs_cell(x):
+    if isinstance(x, (list, tuple, np.ndarray)):
+        return [int(v) % 12 for v in x]
+    if isinstance(x, str):
+        try:
+            v = ast.literal_eval(x)
+            if isinstance(v, (list, tuple)):
+                return [int(w) % 12 for w in v]
+        except Exception:
+            pass
+        # fallback: try split on non-digits/commas like "C:E:G" -> unsupported here
+    return None
+
+
+def pcs_hist(pcs, normalize=True):
+    h = np.zeros(12, dtype=float)
+    for p in pcs:
+        h[int(p) % 12] += 1.0
+    if normalize and h.sum() > 0:
+        h /= h.sum()
+    return h
+
+
+def _emd_line(h, g):
+    # 1D Wasserstein-1 on a line with unit spacing = sum |cumsum(h-g)|
+    diff = h - g
+    c = np.cumsum(diff)
+    return np.sum(np.abs(c))
+
+
+def emd_circle(h, g):
+    # Wasserstein-1 on the circle S^1 (12 points):
+    # choose the best rotation/cut; compute 1D EMD on the line
+    best = np.inf
+    for s in range(12):
+        hs = np.roll(h, s)
+        w = _emd_line(hs, g)
+        if w < best:
+            best = w
+    return float(best)
+
+
+def build_vl_matrix_from_meta(
+    meta, pcs_col_candidates=("pcs", "pcset", "pitch_classes", "pcset_str")
+):
+    pcs_lists = None
+    for col in pcs_col_candidates:
+        if col in meta.columns:
+            parsed = meta[col].apply(_parse_pcs_cell)
+            if parsed.notnull().all():
+                pcs_lists = parsed.tolist()
+                break
+    if pcs_lists is None:
+        raise ValueError(
+            "No usable pitch-class column found. Add a column 'pcs' containing a list/tuple of pitch classes per event."
+        )
+
+    H = np.stack([pcs_hist(pcs, normalize=True) for pcs in pcs_lists], axis=0)
+    n = H.shape[0]
+    D = np.zeros((n, n), dtype=float)
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = emd_circle(H[i], H[j])
+            D[i, j] = D[j, i] = d
+    return D
+
+
+def vl_successive_series(D, order_index=None):
+    if order_index is None:
+        idx = np.arange(D.shape[0])
+    else:
+        idx = np.asarray(order_index, dtype=int)
+    s = []
+    for k in range(len(idx) - 1):
+        s.append(D[idx[k], idx[k + 1]])
+    return np.array(s)
+
+
+def embed_vl_mds(D, random_state=0):
+    mds = MDS(
+        n_components=2,
+        dissimilarity="precomputed",
+        random_state=random_state,
+        n_init=4,
+        max_iter=200,
+        eps=1e-3,
+    )
+    Y = mds.fit_transform(D)
+    return Y
+
+
+def build_vl_graph(D, threshold):
+    n = D.shape[0]
+    G = nx.Graph()
+    G.add_nodes_from(range(n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            if D[i, j] <= threshold:
+                G.add_edge(i, j, weight=float(D[i, j]))
+    return G
+
+
+def plot_vl_embedding(Y, color=None, title="Voice-leading MDS (circular Wasserstein)"):
+    plt.figure(figsize=(6.0, 5.2))
+    if color is None:
+        plt.scatter(Y[:, 0], Y[:, 1], s=8)
+    else:
+        plt.scatter(Y[:, 0], Y[:, 1], s=8, c=color)
+    plt.xlabel("MDS-1")
+    plt.ylabel("MDS-2")
+    plt.title(title)
+    plt.tight_layout()
+
+
+def plot_vl_graph(G, Y=None, title="Parsimonious progression network"):
+    plt.figure(figsize=(6.4, 5.6))
+    pos = {i: Y[i] for i in G.nodes()} if Y is not None else nx.spring_layout(G, seed=0)
+    nx.draw_networkx_nodes(G, pos, node_size=20)
+    nx.draw_networkx_edges(G, pos, alpha=0.25)
+    plt.axis("off")
+    plt.title(title)
+    plt.tight_layout()
+
+
+def plot_vl_series(series, qlen=None, title="Instantaneous voice-leading cost"):
+    plt.figure(figsize=(7.0, 2.8))
+    plt.plot(series, linewidth=1.0)
+    if qlen is not None:
+        plt.xlabel("Event index (≈ ordered by onset; qL grid)")
+    else:
+        plt.xlabel("Event index")
+    plt.ylabel("VL cost")
+    plt.title(title)
+    plt.tight_layout()
+
+
+def run_voice_leading(meta, outdir, vl_thresh=0.35, color_key="root_pc"):
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    D = build_vl_matrix_from_meta(meta)
+    np.savetxt(outdir / "b9_voiceleading_dist.csv", D, delimiter=",")
+
+    if "onset_qL" in meta.columns:
+        order_idx = np.argsort(meta["onset_qL"].values)
+    else:
+        order_idx = np.arange(len(meta))
+
+    series = vl_successive_series(D, order_index=order_idx)
+    np.savetxt(outdir / "b9_voiceleading_series.csv", series, delimiter=",")
+
+    Y = embed_vl_mds(D, random_state=0)
+    np.savetxt(outdir / "b9_voiceleading_mds2.csv", Y, delimiter=",")
+
+    if color_key in meta.columns:
+        color_vec = meta[color_key].to_numpy()
+    else:
+        color_vec = None
+
+    plot_vl_embedding(Y, color=color_vec, title="VL map (MDS on circular EMD)")
+    plt.savefig(outdir / "b9_vl_map.png", dpi=160)
+    plt.close()
+
+    G = build_vl_graph(D, threshold=vl_thresh)
+    plot_vl_graph(G, Y=Y, title=f"Parsimonious VL network (≤ {vl_thresh:.2f})")
+    plt.savefig(outdir / "b9_vl_graph.png", dpi=160)
+    plt.close()
+
+    plot_vl_series(series, qlen=True, title="Instantaneous VL cost across events")
+    plt.savefig(outdir / "b9_vl_series.png", dpi=160)
+    plt.close()
+
+
 def main():
     import argparse
 
@@ -340,15 +531,43 @@ def main():
         )
 
     X, meta = build_feature_matrix(events)
-    run_mapper(
+    meta = ensure_pcs_column(meta)
+    meta["size"] = meta["pcs"].apply(lambda xs: len(xs))
+
+    from tda_extras import build_vl_matrix_from_meta
+
+    # right before run_voice_leading(...) or wherever you want the VL analysis:
+    D = build_vl_matrix_from_meta(meta)
+    np.savetxt(Path(outdir) / "b9_voiceleading_D.csv", D, delimiter=",")
+
+    run_voice_leading(meta, outdir=args.outdir, vl_thresh=0.35, color_key="root_pc")
+
+    outdir = Path(args.outdir)
+
+    # 0) “Visualization” / insight dumps for inspection
+    summarize_dataframe(meta, "chords_meta", outdir)
+
+    # Compute PH quickly (scalable defaults)
+    ph = compute_persistence_and_reports(
         X,
-        meta,
-        outdir=args.outdir,
-        n_cubes=args.ncubes,
-        overlap=args.overlap,
-        color_mode=args.color,
+        outdir=outdir,
+        maxdim=1,  # start with H0/H1
+        n_betti_samples=300,
+        metric="euclidean",
+        max_points=2000,  # cap points
+        n_perm=800,  # sparse Rips
+        thresh=None,  # set a value to prune if you like
+        seed=0,
     )
+    print("PH done; results in", outdir)
 
 
 if __name__ == "__main__":
     main()
+
+# TODO:
+# 1. trying different clusterings
+# 2. find meaning for the data
+# 3. muscial interpretation?
+# 4. explore different overlap/args & see what change
+# 5. add different composition/movements
